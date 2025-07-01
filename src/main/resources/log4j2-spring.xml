@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" monitorInterval="30">
+    <Properties>
+        <Property name="LOG_PATTERN">%style{%d{yyyy-MM-dd HH:mm:ss.SSS}}{cyan} %level{TRACE=🧵,DEBUG=🔧,INFO=ℹ️,WARN=⚠️,ERROR=❌,FATAL=☠️} %style{[%t]}{magenta} %style{%c{1.}}{blue}: %msg%n%throwable</Property>
+    </Properties>
+    <Appenders>
+        <Console name="console" target="SYSTEM_OUT" follow="true">
+            <PatternLayout pattern="${LOG_PATTERN}"/>
+        </Console>
+    </Appenders>
+
+    <Loggers>
+        <Logger name="org.apache.kafka" level="WARN" additivity="false">
+            <AppenderRef ref="console"/>
+        </Logger>
+        <Logger name="io.r" level="DEBUG" additivity="false">
+            <AppenderRef ref="console"/>
+        </Logger>
+        <Root level="info">
+            <AppenderRef ref="console"/>
+        </Root>
+    </Loggers>
+</Configuration>

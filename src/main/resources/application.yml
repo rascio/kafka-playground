@@ -1,0 +1,13 @@
+
+#  management.endpoints.access.default=none
+
+management:
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        include: "*"
+
+kafka:
+  outputTopic: "output" # Configurable output topic
+  stopTimeoutSeconds: 30 # Configurable stop timeout in seconds
