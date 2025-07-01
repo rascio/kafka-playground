@@ -1,5 +1,6 @@
 package io.r.kafkaplayground.kafka
 
+import io.r.kafkaplayground.utils.drain
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,7 +57,7 @@ import kotlin.coroutines.CoroutineContext
  */
 @Service
 @Controller
-open class KafkaService(
+class KafkaService(
     private val receiver: KafkaReceiver<String, String>,
     private val sender: KafkaSender<String, String>,
     private val processor: MessageProcessor,
@@ -249,16 +250,15 @@ open class KafkaService(
      *
      * @return A Flow of SenderRecords to be sent to Kafka.
      */
-    private fun Flow<String>.publish() =
-        asFlux()
-            .map { message ->
-                SenderRecord.create(
-                    ProducerRecord(config.outputTopic, UUID.randomUUID().toString(), message), // Use configurable topic
-                    message
-                )
-            }
-            .transform { sender.send(it) }
-            .asFlow()
+    private fun Flow<String>.publish() = asFlux()
+        .map { message ->
+            SenderRecord.create(
+                ProducerRecord(config.outputTopic, UUID.randomUUID().toString(), message), // Use configurable topic
+                message
+            )
+        }
+        .transform { sender.send(it) }
+        .asFlow()
 
     /**
      * Represents the state of the Kafka service.
@@ -289,18 +289,5 @@ open class KafkaService(
         private val COROUTINE_EXCEPTION_HANDLER = CoroutineExceptionHandler { _, throwable ->
             logger.error("Unmanaged exceptions raised in message processing loop", throwable)
         }
-
-        /**
-         * Drains all remaining elements from a ReceiveChannel into a Flow.
-         *
-         * @return A Flow containing all elements from the channel.
-         */
-        fun <T> ReceiveChannel<T>.drain() = flow {
-            var last = tryReceive()
-            while (last.isSuccess) {
-                emit(last.getOrThrow())
-                last = tryReceive()
-            }
-        }.buffer(10)
     }
 }
