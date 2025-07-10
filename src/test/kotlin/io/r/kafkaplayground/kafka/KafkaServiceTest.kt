@@ -1,9 +1,14 @@
 package io.r.kafkaplayground.kafka
 
 import io.r.utils.concurrency.Barrier
+import io.r.utils.concurrency.CountDownLatch
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.reactive.awaitFirst
 import kotlinx.coroutines.reactive.awaitLast
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import org.apache.kafka.clients.admin.Admin
 import org.apache.kafka.clients.admin.AdminClientConfig
 import org.apache.kafka.clients.admin.NewTopic
@@ -23,8 +28,11 @@ import reactor.kafka.receiver.ReceiverOptions
 import reactor.kafka.sender.KafkaSender
 import reactor.kafka.sender.SenderOptions
 import reactor.kafka.sender.SenderRecord
+import reactor.test.StepVerifier
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
+import kotlin.time.Duration.Companion.seconds
 
 
 class KafkaServiceTest {
@@ -39,7 +47,9 @@ class KafkaServiceTest {
     private lateinit var sender: KafkaSender<String, String>
     private lateinit var sinkReceiver: KafkaReceiver<String, String>
 
-    private lateinit var underTest: KafkaService
+    private lateinit var underTest: KafkaService<String, String, String, String>
+
+    private val processor = DumbMessageProcessor()
 
     @BeforeEach
     fun setUp() {
@@ -59,6 +69,15 @@ class KafkaServiceTest {
                 .subscription(listOf("output"))
         )
         sender = KafkaSender.create(producerOptions<String, String>(bootstrapServers))
+
+        underTest = KafkaService(
+            receiver = receiver,
+            sender = sender,
+            processor = processor,
+            config = config
+        )
+
+        underTest.start()
     }
 
     @AfterEach
@@ -71,15 +90,7 @@ class KafkaServiceTest {
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    fun `test consume and produce messages`() = runBlocking {
-        underTest = KafkaService(
-            receiver = receiver,
-            sender = sender,
-            processor = MessageProcessor(),
-            config = config
-        )
-
-        underTest.start()
+    fun `consume and produce messages`() = runBlocking {
 
         // Send a message to the input topic
         sender.send(
@@ -89,7 +100,7 @@ class KafkaServiceTest {
                     0,
                     System.currentTimeMillis(),
                     "key1",
-                    "Hello, World!",
+                    "test",
                     null
                 )
             )
@@ -101,29 +112,20 @@ class KafkaServiceTest {
             .awaitFirst()
             .value()
 
-        assertEquals("Processed: Hello, World!", messages)
+        assertEquals("TEST", messages)
     }
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    fun `test messages from different partitions are processed in parallel`() = runBlocking {
+    fun `messages from different partitions are processed in parallel`() = runBlocking {
 
         val barrier = Barrier(3)
 
-        underTest = KafkaService(
-            receiver = receiver,
-            sender = sender,
-            processor = MessageProcessor(
-                sideEffect = {
-                    println("side effect: $it")
-                    barrier.await()
-                    println("side effect done: $it")
-                },
-            ),
-            config = config
-        )
-
-        underTest.start()
+        processor.sideEffect = {
+            println("side effect: $it")
+            barrier.await()
+            println("side effect done: $it")
+        }
 
         // Send a message to the input topic
         val records = listOf(0 to "msg_1000", 1 to "msg_200", 2 to "msg_300")
@@ -154,9 +156,64 @@ class KafkaServiceTest {
             .toSet()
         println("Received messages: $messages")
 
-        assertEquals(setOf("Processed: msg_1000", "Processed: msg_200", "Processed: msg_300"), messages)
+        assertEquals(setOf("MSG_1000", "MSG_200", "MSG_300"), messages)
         println("Test completed successfully")
     }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    fun `given a running process when stop then it should process all the in flight messages before stop`() = runBlocking {
+
+        val mutex = Mutex(locked = true)
+        val latch = CountDownLatch(3)
+
+        processor.sideEffect = {
+            latch.countDown()
+            mutex.withLock { /* Force it to wait until we release it */ }
+        }
+
+        // Send a message to the input topic
+        val records = listOf("msg_300", "msg_200", "msg_100")
+            .mapIndexed { p, msg ->
+                SenderRecord.create(
+                    "test-topic",
+                    p,
+                    System.currentTimeMillis(),
+                    "key$p",
+                    msg,
+                    null
+                )
+            }
+
+        println("Sending records: $records")
+        Flux.fromIterable(records)
+            .transform(sender::send)
+            .awaitLast()
+
+
+        val runAndAssert = launch {
+            // Verify that the message was processed and sent to the output topic
+            sinkReceiver.receive()
+                .map { it.value() }
+                .let(StepVerifier::create)
+                .expectNext("MSG_100")
+                .expectNext("MSG_200")
+                .expectNext("MSG_300")
+        }
+
+        check(latch.await(3.seconds)) { "Latch did not reach zero in time" }
+        println("Stopping the service, it should process all in-flight messages before stopping...")
+        underTest.stop {
+            mutex.unlock() // Allow the processing to continue
+            println("Service stopped, processing should be complete.")
+        }
+        println("Waiting for the processing to complete...")
+
+        runAndAssert.join()
+
+        println("Test completed successfully")
+    }
+
 
     private fun initKafka(bootstrapServers: String) {
         Admin.create(mapOf(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers))

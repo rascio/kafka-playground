@@ -5,11 +5,15 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Component
+import java.util.UUID
+
+interface MessageProcessor<Input, OutputKey, OutputValue> {
+    fun processMessage(message: Input): Flow<Pair<OutputKey, OutputValue>>
+}
 
 @Component
-class MessageProcessor(val sideEffect: suspend (String) -> Unit = {}) {
-
-    fun processMessage(message: String): Flow<String> = flow {
+class DumbMessageProcessor(var sideEffect: suspend (String) -> Unit = {}) : MessageProcessor<String, String, String> {
+    override fun processMessage(message: String): Flow<Pair<String, String>> = flow {
         logger.info("Processing message: $message")
 
         // Extract number from message
@@ -27,7 +31,7 @@ class MessageProcessor(val sideEffect: suspend (String) -> Unit = {}) {
 
         logger.info("Processing message finished: {}", message)
         // Simulate message processing
-        emit("Processed: $message")
+        emit(UUID.randomUUID().toString() to message.uppercase())
     }
 
     companion object {

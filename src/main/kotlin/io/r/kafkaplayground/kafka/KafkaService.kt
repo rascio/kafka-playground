@@ -6,12 +6,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flatMapConcat
 import kotlinx.coroutines.flow.flatMapMerge
@@ -21,7 +19,6 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.flow.takeWhile
-import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.reactive.asFlow
 import kotlinx.coroutines.reactor.asFlux
@@ -31,16 +28,15 @@ import kotlinx.coroutines.selects.whileSelect
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.slf4j.LoggerFactory
 import org.springframework.context.SmartLifecycle
-import org.springframework.stereotype.Controller
-import org.springframework.stereotype.Service
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.ResponseBody
+import reactor.core.publisher.Flux
 import reactor.kafka.receiver.KafkaReceiver
 import reactor.kafka.receiver.ReceiverRecord
 import reactor.kafka.sender.KafkaSender
 import reactor.kafka.sender.SenderRecord
-import java.util.UUID
+import reactor.kafka.sender.SenderResult
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
@@ -55,12 +51,10 @@ import kotlin.coroutines.CoroutineContext
  * @property processor MessageProcessor for processing individual Kafka messages.
  * @property config KafkaServiceConfig for configurable properties.
  */
-@Service
-@Controller
-class KafkaService(
-    private val receiver: KafkaReceiver<String, String>,
-    private val sender: KafkaSender<String, String>,
-    private val processor: MessageProcessor,
+class KafkaService<InputKey, InputValue, OutputKey, OutputValue>(
+    private val receiver: KafkaReceiver<InputKey, InputValue>,
+    private val sender: KafkaSender<OutputKey, OutputValue>,
+    private val processor: MessageProcessor<InputValue, OutputKey, OutputValue>,
     private val config: KafkaServiceConfig // Injected configuration
 ) : SmartLifecycle, CoroutineScope {
 
@@ -138,52 +132,48 @@ class KafkaService(
             return
         }
 
-        // Receive messages from Kafka and process them
+        /*
+         * Process messages inside a flow to manage scheduling parallelism and backpressure.
+         * Produce the messages into a channel that can be consumed by the processing loop.
+         * 'takeWhile' ensures that we only process messages while the service is in the Started state.
+         * This is not enough though, as we want to stop processing also when we don't receive any messages
+         * The 'stateChanges' channel will handle that case.
+         */
         val messages = receiver.receiveBatch()
             .asFlow()
             .onEach { logger.debug("Received batch") }
             .takeWhile { state.value is State.Started }
-            .flatMapConcat { batch ->
-                batch.groupBy { it.partition() }
-                    .asFlow()
-                    .map { partition ->
-                        // Group messages by partition and sort by offset
-                        partition.key() to partition
-                            .sort(Comparator.comparing { r -> r.receiverOffset().offset() })
-                            .collectList()
-                            .awaitSingle()
-                    }
-                    // Process each partition in parallel
-                    .flatMapMerge { (partition, batch) ->
-                        flow {
-                            batch.asFlow()
-                                .flatMapConcat {
-                                    logger.info("Received partition={} offset={}", partition, it.offset())
-                                    processRecord(it)
-                                }
-                                .toList()
-                                .also { emit(it) }
-                        }
-                    }
-            }
+            .flatMapConcat { processBatch(batch = it) }
             .produceIn(this@KafkaService)
 
+        /*
+         * Send all the state changes to a channel.
+         * This needs to be outside the 'whileSelect' otherwise at every loop iteration
+         * a new channel would be created.
+         */
         val stateChanges = state.asStateFlow()
             .produceIn(this@KafkaService)
 
         logger.debug("Kafka service processing loop starting")
-        // Main processing loop that continues until the service is stopped
+        /*
+         * Race between receiving messages and state changes.
+         * This loop until we receive a state change to Closing.
+         */
         whileSelect {
             messages.onReceive { true }
             stateChanges.onReceive { it is State.Started }
         }
         logger.debug("Kafka service processing loop has stopped")
 
-        // Drain remaining messages
+        /*
+         * Drain remaining messages from the channel to ensure all messages are processed
+         * This is needed as the 'whenSelect' loop may observe the state change
+         * and messages may still be in the channel.
+         */
         logger.debug("Draining remaining messages from channel")
         messages.drain().collect { }
 
-        // Clean up resources when stopping
+        // After draining, we can safely close the message channel
         logger.debug("Closing message channel")
         runCatching { messages.cancel() }
             .onFailure { logger.warn("Message channel was already closed") }
@@ -200,13 +190,42 @@ class KafkaService(
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun processBatch(batch: Flux<ReceiverRecord<InputKey, InputValue>>): Flow<SenderResult<OutputValue>> =
+        batch.groupBy { it.partition() }
+            .asFlow()
+            .map { partition ->
+                // Group messages by partition and sort by offset
+                partition.key() to partition
+                    .sort(Comparator.comparing { r -> r.offset() })
+                    .collectList()
+                    .awaitSingle()
+            }
+            // Process each partition in parallel
+            .flatMapMerge { (partition, batch) ->
+                processPartition(batch, partition)
+            }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun processPartition(
+        batch: List<ReceiverRecord<InputKey, InputValue>>,
+        partition: Int
+    ): Flow<SenderResult<OutputValue>> = flow {
+        batch.asFlow()
+            .flatMapConcat {
+                logger.info("Received partition={} offset={}", partition, it.offset())
+                processRecord(it)
+            }
+            .collect { emit(it) }
+    }
+
     /**
      * Processes a single Kafka record by delegating to the MessageProcessor.
      * Handles errors and commits offsets upon successful processing.
      *
      * @param record The Kafka record to process.
      */
-    private fun processRecord(record: ReceiverRecord<String, String>) =
+    private fun processRecord(record: ReceiverRecord<InputKey, InputValue>) =
         processor.processMessage(record.value())
             .publish()
             .catch { error ->
@@ -225,7 +244,7 @@ class KafkaService(
                         .awaitSingleOrNull()
 
                     else -> logger.warn(
-                        "Unknown error during record processing partition={} offset={}, errors should had been caught earlier",
+                        "Unknown error during record processing partition={} offset={}, errors should have been caught earlier",
                         record.partition(),
                         record.offset(),
                         error
@@ -250,10 +269,10 @@ class KafkaService(
      *
      * @return A Flow of SenderRecords to be sent to Kafka.
      */
-    private fun Flow<String>.publish() = asFlux()
-        .map { message ->
+    private fun Flow<Pair<OutputKey, OutputValue>>.publish() = asFlux()
+        .map { (key, message) ->
             SenderRecord.create(
-                ProducerRecord(config.outputTopic, UUID.randomUUID().toString(), message), // Use configurable topic
+                ProducerRecord(config.outputTopic, key, message), // Use configurable topic
                 message
             )
         }
@@ -264,19 +283,8 @@ class KafkaService(
      * Represents the state of the Kafka service.
      */
     sealed interface State {
-        /**
-         * Indicates the service is running.
-         */
         data object Started : State
-
-        /**
-         * Indicates the service is stopping and includes a callback to execute upon completion.
-         */
         data class Closing(val callback: Runnable) : State
-
-        /**
-         * Indicates the service is paused.
-         */
         data object Paused : State
     }
 

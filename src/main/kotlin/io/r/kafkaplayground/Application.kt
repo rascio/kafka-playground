@@ -1,7 +1,8 @@
 package io.r.kafkaplayground
 
+import io.r.kafkaplayground.kafka.DumbMessageProcessor
+import io.r.kafkaplayground.kafka.KafkaService
 import io.r.kafkaplayground.kafka.KafkaServiceConfig
-import jakarta.annotation.PreDestroy
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
@@ -28,19 +29,33 @@ private const val BOOTSTRAP_SERVERS = "localhost:9092"
 @EnableConfigurationProperties(
     KafkaServiceConfig::class
 )
-open class Application {
+class Application {
 
     @get:Bean
-    open val receiver: KafkaReceiver<String, String>
+    val receiver: KafkaReceiver<String, String>
         get() = KafkaReceiver.create(
             receiverOptions<String, String>().subscription(listOf("test-topic"))
         )
 
-    @get:Bean
-    open val publisher: KafkaSender<String, String>
-        get() = AutoCloseKafkaSender(
-            KafkaSender.create(producerOptions<String, String>())
+    @get:Bean(destroyMethod = "close")
+    val publisher: KafkaSender<String, String>
+        get() = KafkaSender.create(
+            producerOptions<String, String>()
         )
+
+    @Bean
+    fun kafkaService(
+        receiver: KafkaReceiver<String, String>,
+        sender: KafkaSender<String, String>,
+        config: KafkaServiceConfig
+    ): KafkaService<String, String, String, String> {
+        return KafkaService(
+            receiver = receiver,
+            sender = sender,
+            processor = DumbMessageProcessor(),
+            config = config
+        )
+    }
 
 
     private fun <K, V> producerOptions(): SenderOptions<K, V> {
@@ -64,15 +79,5 @@ open class Application {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(Application::class.java)
-    }
-}
-
-open class AutoCloseKafkaSender <K, V> (
-    private val sender: KafkaSender<K, V>
-) : KafkaSender<K, V> by sender {
-
-    @PreDestroy
-    fun destroy() {
-        sender.close()
     }
 }
