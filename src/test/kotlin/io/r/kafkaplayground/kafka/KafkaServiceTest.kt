@@ -2,25 +2,26 @@ package io.r.kafkaplayground.kafka
 
 import io.r.utils.concurrency.Barrier
 import io.r.utils.concurrency.CountDownLatch
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.reactive.awaitFirst
 import kotlinx.coroutines.reactive.awaitLast
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import org.apache.kafka.clients.admin.Admin
 import org.apache.kafka.clients.admin.AdminClientConfig
 import org.apache.kafka.clients.admin.NewTopic
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.serialization.StringSerializer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.api.Timeout
-import org.testcontainers.containers.GenericContainer
 import org.testcontainers.kafka.KafkaContainer
 import reactor.core.publisher.Flux
 import reactor.kafka.receiver.KafkaReceiver
@@ -28,21 +29,28 @@ import reactor.kafka.receiver.ReceiverOptions
 import reactor.kafka.sender.KafkaSender
 import reactor.kafka.sender.SenderOptions
 import reactor.kafka.sender.SenderRecord
-import reactor.test.StepVerifier
+import java.util.UUID
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.time.Duration.Companion.seconds
 
 
+private const val INPUT_TOPIC = "test-topic"
+
+private const val OUTPUT_TOPIC = "output"
+
+private const val TEST_CONSUMER_GROUP = "test"
+
+@TestInstance(TestInstance.Lifecycle.PER_METHOD)
 class KafkaServiceTest {
 
     private val config = KafkaServiceConfig(
-        outputTopic = "output",
+        outputTopic = OUTPUT_TOPIC,
         stopTimeoutSeconds = 30L
     )
 
-    private lateinit var kafka: GenericContainer<*>
+    private lateinit var kafka: KafkaContainer
+    private lateinit var kafkaAdmin: Admin
     private lateinit var receiver: KafkaReceiver<String, String>
     private lateinit var sender: KafkaSender<String, String>
     private lateinit var sinkReceiver: KafkaReceiver<String, String>
@@ -58,17 +66,23 @@ class KafkaServiceTest {
 
         val bootstrapServers = "localhost:${kafka.getMappedPort(9092)}"
 
-        initKafka(bootstrapServers)
+        kafkaAdmin = Admin.create(
+            mapOf(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers
+            )
+        )
+
+        initKafka(kafkaAdmin)
 
         receiver = KafkaReceiver.create(
-            receiverOptions<String, String>(bootstrapServers, "sample-consumer")
-                .subscription(listOf("test-topic"))
+            receiverOptions<String, String>(bootstrapServers, TEST_CONSUMER_GROUP, "sample-consumer")
+                .subscription(listOf(INPUT_TOPIC))
         )
         sinkReceiver = KafkaReceiver.create(
-            receiverOptions<String, String>(bootstrapServers, "sample-consumer-test")
-                .subscription(listOf("output"))
+            receiverOptions<String, String>(bootstrapServers, TEST_CONSUMER_GROUP, "sample-consumer-test")
+                .subscription(listOf(OUTPUT_TOPIC))
         )
-        sender = KafkaSender.create(producerOptions<String, String>(bootstrapServers))
+        sender = KafkaSender.create(senderOptions<String, String>(bootstrapServers))
 
         underTest = KafkaService(
             receiver = receiver,
@@ -84,6 +98,7 @@ class KafkaServiceTest {
     fun tearDown() {
         underTest.stop()
         sender.close()
+        kafkaAdmin.close()
         kafka.stop()
     }
 
@@ -96,11 +111,11 @@ class KafkaServiceTest {
         sender.send(
             Flux.just(
                 SenderRecord.create(
-                    "test-topic",
+                    INPUT_TOPIC,
                     0,
                     System.currentTimeMillis(),
                     "key1",
-                    "test",
+                    TEST_CONSUMER_GROUP,
                     null
                 )
             )
@@ -113,6 +128,13 @@ class KafkaServiceTest {
             .value()
 
         assertEquals("TEST", messages)
+
+        kafkaAdmin.assertOffsetsForTopic(
+            groupId = TEST_CONSUMER_GROUP,
+            expectedTopicAndPartitions = mapOf(
+                INPUT_TOPIC to mapOf(0 to 1L)
+            )
+        )
     }
 
     @Test
@@ -131,7 +153,7 @@ class KafkaServiceTest {
         val records = listOf(0 to "msg_1000", 1 to "msg_200", 2 to "msg_300")
             .map { (p, msg) ->
                 SenderRecord.create(
-                    "test-topic",
+                    INPUT_TOPIC,
                     p,
                     System.currentTimeMillis(),
                     "key$p",
@@ -157,96 +179,148 @@ class KafkaServiceTest {
         println("Received messages: $messages")
 
         assertEquals(setOf("MSG_1000", "MSG_200", "MSG_300"), messages)
-        println("Test completed successfully")
+
+        kafkaAdmin.assertOffsetsForTopic(
+            groupId = TEST_CONSUMER_GROUP,
+            expectedTopicAndPartitions = mapOf(
+                INPUT_TOPIC to mapOf(
+                    0 to 1L,
+                    1 to 1L,
+                    2 to 1L
+                )
+            )
+        )
     }
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    fun `given a running process when stop then it should process all the in flight messages before stop`() = runBlocking {
+    fun `given a running process when stop then it should process all the in flight messages before stop`() =
+        runBlocking {
 
-        val mutex = Mutex(locked = true)
-        val latch = CountDownLatch(3)
+            val mutex = Mutex(locked = true)
+            val latch = CountDownLatch(3)
 
-        processor.sideEffect = {
-            latch.countDown()
-            mutex.withLock { /* Force it to wait until we release it */ }
-        }
-
-        // Send a message to the input topic
-        val records = listOf("msg_300", "msg_200", "msg_100")
-            .mapIndexed { p, msg ->
-                SenderRecord.create(
-                    "test-topic",
-                    p,
-                    System.currentTimeMillis(),
-                    "key$p",
-                    msg,
-                    null
-                )
+            processor.sideEffect = {
+                latch.countDown()
+                mutex.withLock { /* Force it to wait until we release it */ }
             }
 
-        println("Sending records: $records")
-        Flux.fromIterable(records)
-            .transform(sender::send)
-            .awaitLast()
+            // Send a message to the input topic
+            val records = listOf("msg_300", "msg_200", "msg_100")
+                .mapIndexed { p, msg ->
+                    SenderRecord.create(
+                        INPUT_TOPIC,
+                        p,
+                        System.currentTimeMillis(),
+                        "key$p",
+                        msg,
+                        null
+                    )
+                }
+
+            println("Sending records: $records")
+            Flux.fromIterable(records)
+                .transform(sender::send)
+                .awaitLast()
 
 
-        val runAndAssert = launch {
-            // Verify that the message was processed and sent to the output topic
-            sinkReceiver.receive()
-                .map { it.value() }
-                .let(StepVerifier::create)
-                .expectNext("MSG_100")
-                .expectNext("MSG_200")
-                .expectNext("MSG_300")
-        }
+            val runAndAssert = launch {
+                // Verify that the message was processed and sent to the output topic
+                val result = sinkReceiver.receive()
+                    .map { it.value() }
+                    .take(3)
+                    .collectList()
+                    .awaitFirst()
+                    .toSet()
 
-        check(latch.await(3.seconds)) { "Latch did not reach zero in time" }
-        println("Stopping the service, it should process all in-flight messages before stopping...")
-        underTest.stop {
+                assertEquals(setOf("MSG_100", "MSG_300", "MSG_200"), result)
+            }
+
+            check(latch.await(3.seconds)) { "Latch did not reach zero in time" }
+            println("Stopping the service, it should process all in-flight messages before stopping...")
             mutex.unlock() // Allow the processing to continue
-            println("Service stopped, processing should be complete.")
-        }
-        println("Waiting for the processing to complete...")
-
-        runAndAssert.join()
-
-        println("Test completed successfully")
-    }
-
-
-    private fun initKafka(bootstrapServers: String) {
-        Admin.create(mapOf(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers))
-            .use { admin ->
-                val topics = listOf(
-                    NewTopic("test-topic", 3, 1.toShort()),
-                    NewTopic("output", 3, 1.toShort())
-                )
-                admin.createTopics(topics)
-                    .all()
-                    .toCompletionStage()
-                    .toCompletableFuture()
-                    .join()
+            underTest.stop {
+                println("Service stopped, processing should be complete.")
             }
+            println("Waiting for the processing to complete...")
+
+            runAndAssert.join()
+
+            kafkaAdmin.assertOffsetsForTopic(
+                groupId = TEST_CONSUMER_GROUP,
+                expectedTopicAndPartitions = mapOf(
+                    INPUT_TOPIC to mapOf(
+                        0 to 1L,
+                        1 to 1L,
+                        2 to 1L
+                    )
+                )
+            )
+        }
+
+
+    private fun initKafka(admin: Admin) {
+        val topics = listOf(
+            NewTopic(INPUT_TOPIC, 3, 1.toShort()),
+            NewTopic(OUTPUT_TOPIC, 3, 1.toShort())
+        )
+        admin.createTopics(topics)
+            .all()
+            .toCompletionStage()
+            .toCompletableFuture()
+            .join()
     }
 
-    private fun <K, V> producerOptions(bootstrapServers: String): SenderOptions<K, V> {
-        val props: MutableMap<String, Any> = HashMap()
-        props[ProducerConfig.BOOTSTRAP_SERVERS_CONFIG] = bootstrapServers
-        props[ProducerConfig.CLIENT_ID_CONFIG] = "sample-producer"
-        props[ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG] = StringSerializer::class.java
-        props[ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG] = StringSerializer::class.java
-        return SenderOptions.create(props)
+
+    private fun KafkaContainer.consumer(groupId: String = TEST_CONSUMER_GROUP): KafkaConsumer<String, String> {
+        val bootstrapServers = "localhost:${this.getMappedPort(9092)}"
+        val properties = consumerProperties(bootstrapServers, groupId, UUID.randomUUID().toString())
+        return KafkaConsumer(properties)
     }
 
-    private fun <K, V> receiverOptions(bootstrapServers: String, clientId: String): ReceiverOptions<K, V> {
-        val props: MutableMap<String, Any> = HashMap()
-        props[ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG] = bootstrapServers
-        props[ConsumerConfig.CLIENT_ID_CONFIG] = clientId
-        props[ConsumerConfig.GROUP_ID_CONFIG] = "sample-group"
-        props[ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG] = StringDeserializer::class.java
-        props[ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG] = StringDeserializer::class.java
-        props[ConsumerConfig.AUTO_OFFSET_RESET_CONFIG] = "earliest"
-        return ReceiverOptions.create(props)
+    private fun producerProperties(bootstrapServers: String) = mapOf(
+        ProducerConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers,
+        ProducerConfig.CLIENT_ID_CONFIG to "sample-producer",
+        ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG to StringSerializer::class.java,
+        ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG to StringSerializer::class.java
+    )
+
+    private fun <K, V> senderOptions(bootstrapServers: String) =
+        SenderOptions.create<K, V>(producerProperties(bootstrapServers))
+
+    private fun consumerProperties(bootstrapServers: String, groupId: String = TEST_CONSUMER_GROUP, clientId: String = TEST_CONSUMER_GROUP) =
+        mapOf(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to bootstrapServers,
+            ConsumerConfig.CLIENT_ID_CONFIG to clientId,
+            ConsumerConfig.GROUP_ID_CONFIG to groupId,
+            ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG to StringDeserializer::class.java,
+            ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG to StringDeserializer::class.java,
+            ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest"
+        )
+
+    private fun <K, V> receiverOptions(bootstrapServers: String, groupId: String, clientId: String) =
+        ReceiverOptions.create<K, V>(consumerProperties(bootstrapServers, groupId, clientId))
+
+
+    private suspend fun Admin.assertOffsetsForTopic(groupId: String, expectedTopicAndPartitions: Map<String, Map<Int, Long>>) {
+        val data = listConsumerGroupOffsets(groupId)
+            .all()
+            .toCompletionStage()
+            .await()
+            .entries
+            .first { it.key == groupId }
+            .value
+            .entries
+            .asSequence()
+            .groupBy { it.key.topic() }
+            .map {
+                it.key to it.value.associate { (topicPartition, metadata) ->
+                    topicPartition.partition() to metadata.offset()
+                }
+            }
+            .toMap()
+
+        assertEquals(expectedTopicAndPartitions, data)
     }
+
 }

@@ -16,6 +16,8 @@ class DumbMessageProcessor(var sideEffect: suspend (String) -> Unit = {}) : Mess
     override fun processMessage(message: String): Flow<Pair<String, String>> = flow {
         logger.info("Processing message: $message")
 
+        runCatching { sideEffect(message) }
+            .onFailure { logger.error("Error during side effect of message {}", message, it) }
         // Extract number from message
         val numberRegex = "\\d+".toRegex()
         val matchResult = numberRegex.find(message)
@@ -26,8 +28,6 @@ class DumbMessageProcessor(var sideEffect: suspend (String) -> Unit = {}) : Mess
             logger.info("Delaying for $delayTime ms")
             delay(delayTime)
         }
-        runCatching { sideEffect(message) }
-            .onFailure { logger.error("Error during side effect of message {}", message, it) }
 
         logger.info("Processing message finished: {}", message)
         // Simulate message processing

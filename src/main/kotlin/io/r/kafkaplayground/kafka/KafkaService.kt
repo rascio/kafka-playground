@@ -1,16 +1,20 @@
 package io.r.kafkaplayground.kafka
 
-import io.r.kafkaplayground.utils.drain
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.flatMapConcat
 import kotlinx.coroutines.flow.flatMapMerge
 import kotlinx.coroutines.flow.flow
@@ -19,6 +23,7 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.produceIn
 import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.flow.timeout
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.reactive.asFlow
 import kotlinx.coroutines.reactor.asFlux
@@ -32,6 +37,7 @@ import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PostMapping
 import org.springframework.web.bind.annotation.ResponseBody
 import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
 import reactor.kafka.receiver.KafkaReceiver
 import reactor.kafka.receiver.ReceiverRecord
 import reactor.kafka.sender.KafkaSender
@@ -40,6 +46,7 @@ import reactor.kafka.sender.SenderResult
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * KafkaService is responsible for managing the lifecycle of Kafka message processing.
@@ -124,7 +131,7 @@ class KafkaService<InputKey, InputValue, OutputKey, OutputValue>(
      * Starts the main processing loop for consuming and processing Kafka messages.
      * This method runs in a coroutine and handles state transitions and message processing.
      */
-    @OptIn(ExperimentalCoroutinesApi::class)
+    @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
     private suspend fun startProcessingLoop() {
         logger.info("Starting kafka service")
         if (!state.compareAndSet(State.Paused, State.Started)) {
@@ -133,18 +140,22 @@ class KafkaService<InputKey, InputValue, OutputKey, OutputValue>(
         }
 
         /*
-         * Process messages inside a flow to manage scheduling parallelism and backpressure.
-         * Produce the messages into a channel that can be consumed by the processing loop.
-         * 'takeWhile' ensures that we only process messages while the service is in the Started state.
-         * This is not enough though, as we want to stop processing also when we don't receive any messages
-         * The 'stateChanges' channel will handle that case.
+         * We want to process messages and have the possibility to stop the service gracefully.
+         * After getting the messages from the receiver, they are processed by 'processBatch' in parallel.
+         * 'processBatch' takes care also of sending the processed messages to the output topic
+         * and committing the offsets.
+         * The 'takeWhile' operator is used to stop pulling messages from the receiver after the service is stopped.
+         * In order to stop the service gracefully, we use a state flow that allows us
+         * to observe state changes and stop the processing loop when the state changes to Closing.
          */
         val messages = receiver.receiveBatch()
             .asFlow()
+            .takeWhile { state.value is State.Started } // Continue processing while the service is running
             .onEach { logger.debug("Received batch") }
-            .takeWhile { state.value is State.Started }
             .flatMapConcat { processBatch(batch = it) }
+            .buffer(100)
             .produceIn(this@KafkaService)
+
 
         /*
          * Send all the state changes to a channel.
@@ -168,10 +179,18 @@ class KafkaService<InputKey, InputValue, OutputKey, OutputValue>(
         /*
          * Drain remaining messages from the channel to ensure all messages are processed
          * This is needed as the 'whenSelect' loop may observe the state change
-         * and messages may still be in the channel.
+         * and messages may still be in flight.
          */
         logger.debug("Draining remaining messages from channel")
-        messages.drain().collect { }
+        messages.consumeAsFlow()
+            .timeout(1.seconds)
+            .catch { ex ->
+                when (ex) {
+                    is TimeoutCancellationException -> {}
+                    else -> logger.warn("Error draining messages from channel", ex)
+                }
+            }
+            .collect { }
 
         // After draining, we can safely close the message channel
         logger.debug("Closing message channel")
@@ -239,9 +258,13 @@ class KafkaService<InputKey, InputValue, OutputKey, OutputValue>(
             }
             .onCompletion { error ->
                 when (error) {
-                    null -> record.receiverOffset()
-                        .commit()
-                        .awaitSingleOrNull()
+                    null -> {
+                        record.receiverOffset()
+                            .acknowledge()
+                        record.receiverOffset()
+                            .commit()
+                            .awaitSingleOrNull()
+                    }
 
                     else -> logger.warn(
                         "Unknown error during record processing partition={} offset={}, errors should have been caught earlier",
